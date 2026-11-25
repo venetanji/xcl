@@ -727,7 +727,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     for (k, compute) in two_pass_steps(max) {
                         bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
                         let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
-                        pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
+                        fresh_indirect_arguments(this, || pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0));
                         emit_uav_barrier(list, Some(&res_buf));
                     }
                     Ok(())
@@ -2321,6 +2321,7 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
 "#;
         // (constant, groups) of each command
         let commands = [(1u32, 3u32), (2, 2), (3, 4)];
+        for attempt in 0..32 {
         unsafe {
             let mut dev: Option<ID3D12Device> = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
@@ -2387,13 +2388,23 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pass1).unwrap();
+            let raw = list.as_raw();
+            super::super::real::adopt(raw, super::super::real::Kind::CommandList);
+            super::super::list_x::on_create(raw, alloc.as_raw() as usize, pass1.as_raw() as usize, ty);
+            type Ei = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
+            let ei: Ei = std::mem::transmute(super::super::real::orig_fn(raw, 59));
             emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(1, rec.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
             for (k, compute) in two_pass_steps(commands.len() as u32) {
                 list.SetPipelineState(if compute { &pass1 } else { &pass2 });
-                list.ExecuteIndirect(&sig, 1, &indirect, k as u64 * 16, None::<&ID3D12Resource>, 0);
+                let run = || ei(raw, sig.as_raw() as usize, 1, indirect.as_raw() as usize, k as u64 * 16, 0, 0);
+                if std::env::var_os("XCL_TEST_TWO_PASS_UNORDERED").is_some() {
+                    run();
+                } else {
+                    fresh_indirect_arguments(raw, run);
+                }
                 emit_uav_barrier(&list, Some(&rec));
             }
             emit_transition(&list, &indirect, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON);
@@ -2403,10 +2414,11 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             crate::gpu::fence::wait(&done, 1, &dev, None, 10_000).unwrap();
             for &(v, x) in &commands {
                 let got: Vec<u32> = (0..x).map(|g| *o.add((v * 16 + g) as usize)).collect();
-                assert_eq!(got, vec![v; x as usize], "the records the mesh pass of command {v} read");
+                assert_eq!(got, vec![v; x as usize], "attempt {attempt}: the records the mesh pass of command {v} read");
             }
             indirect.Unmap(0, None);
             out.Unmap(0, None);
+        }
         }
     }
 

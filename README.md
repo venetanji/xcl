@@ -210,6 +210,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
   can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks.
+  Two-pass indirect commands order their argument reads before each pass's execution.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
 
 ```powershell
