@@ -610,15 +610,18 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
-    list.SetComputeRootUnorderedAccessView(0, consts_va);
-    list.SetComputeRootUnorderedAccessView(2, src_va);
-    list.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress() + dst_off);
-    if let Some(va) = count_va {
-        list.SetComputeRootUnorderedAccessView(4, va);
-    }
+    bind_scaled_argument_views(list, consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va);
     list.Dispatch(max.div_ceil(64), 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     Ok((dst, dst_off))
+}
+
+unsafe fn bind_scaled_argument_views(list: &ID3D12GraphicsCommandList, io: u64, src: u64, dst: u64, count: Option<u64>) {
+    list.SetComputeRootUnorderedAccessView(0, io);
+    list.SetComputeRootUnorderedAccessView(2, src);
+    list.SetComputeRootUnorderedAccessView(3, dst);
+    // The shader references u4 behind a dynamic flag; it must have a valid root descriptor.
+    list.SetComputeRootUnorderedAccessView(4, count.unwrap_or(io));
 }
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -2184,6 +2187,30 @@ void main(uint t : SV_GroupIndex) {
         );
         DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
+    }
+
+    #[test]
+    fn scaled_arguments_bind_a_valid_count_view_even_without_a_count_buffer() {
+        #[repr(C)]
+        struct FakeList {
+            vt: *const usize,
+            views: Mutex<Vec<(u32, u64)>>,
+        }
+        unsafe extern "system" fn set_uav(this: *mut c_void, slot: u32, address: u64) {
+            (*(this as *const FakeList)).views.lock().unwrap().push((slot, address));
+        }
+        let mut table = [0usize; 64];
+        table[41] = set_uav as usize;
+        let fake = FakeList { vt: table.as_ptr(), views: Mutex::new(Vec::new()) };
+        let raw = &fake as *const FakeList as *mut c_void;
+        unsafe {
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&raw).unwrap();
+            for count in [None, Some(0x5000)] {
+                fake.views.lock().unwrap().clear();
+                bind_scaled_argument_views(list, 0x1000, 0x2000, 0x3000, count);
+                assert_eq!(*fake.views.lock().unwrap(), vec![(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, count.unwrap_or(0x1000))]);
+            }
+        }
     }
 
     #[test]
