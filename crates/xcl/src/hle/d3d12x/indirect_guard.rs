@@ -210,11 +210,15 @@ unsafe fn guard_of(list: &ID3D12GraphicsCommandList) -> Option<Arc<Guard>> {
     }
 }
 
+fn compile_program() -> Result<Vec<u8>, String> {
+    // The runtime already requires DXC; Wine's legacy compiler lacks these raw-buffer methods.
+    crate::gpu::recomp::dxc::compile_cached(&program(), "main", "cs_6_0")
+        .map(|(dxil, _)| dxil)
+        .map_err(|e| format!("argument-check shader: {e}"))
+}
+
 unsafe fn make(dev: &ID3D12Device) -> Result<Guard, String> {
-    let cs = real::compile(&program(), "cs_5_0");
-    if cs.is_empty() {
-        return Err("its program does not compile".into());
-    }
+    let cs = compile_program()?;
     let root = |ty, anonymous| D3D12_ROOT_PARAMETER { ParameterType: ty, Anonymous: anonymous, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL };
     let uav = |k| root(D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: k, RegisterSpace: 0 } });
     let params = [
@@ -482,6 +486,16 @@ mod tests {
         assert!(!logged_again(7, 7) && !logged_again(8, 15) && !logged_again(100, 127));
     }
 
+    #[test]
+    fn argument_checker_compiles_with_the_runtime_dxc() {
+        if crate::gpu::recomp::dxc::location().is_err() {
+            skip_test("no DXC");
+            return;
+        }
+        let code = compile_program().expect("compile the production argument checker");
+        assert!(crate::gpu::shader::container_parts(&code).is_some_and(|parts| parts.iter().any(|p| p.fourcc == "DXIL")));
+    }
+
     /// Garbage counts run 0 groups and are kept for the log; counts in range run as they are. Each
     /// case takes the slot the one before it ran from, so that a guard that writes nothing would
     /// run that one's counts.
@@ -508,8 +522,7 @@ void main() { c.InterlockedAdd(0, 1u); }
         unsafe {
             let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
             let Some(dev) = device() else { return };
-            let cs = real::compile(src, "cs_5_0");
-            assert!(!cs.is_empty());
+            let cs = crate::gpu::recomp::dxc::compile(src, "main", "cs_6_0", &[]).expect("compile the group counter");
             let param = D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } },
