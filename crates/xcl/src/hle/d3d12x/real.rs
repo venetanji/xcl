@@ -210,7 +210,7 @@ pub fn uma_window_vas() -> Vec<u64> {
 }
 
 /// the windows' addresses again, for what asks for every draw and dispatch (0: no such window)
-static UMA_WINDOW_VAS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static UMA_WINDOW_VAS: [AtomicU64; crate::gpu::uma::MAX_HEAP_WINDOWS] = [const { AtomicU64::new(0) }; crate::gpu::uma::MAX_HEAP_WINDOWS];
 /// how many there are
 static UMA_WINDOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -226,6 +226,37 @@ fn set_uma_windows(bufs: Vec<(usize, u64)>) {
     }
     UMA_WINDOWS.store(bufs.len().min(UMA_WINDOW_VAS.len()), Ordering::Release);
     *UMA_BUFFER.lock().unwrap() = bufs;
+}
+
+#[cfg(test)]
+mod window_va_tests {
+    use super::*;
+
+    #[test]
+    fn cached_addresses_cover_each_supported_heap_window() {
+        const CHILD: &str = "XCL_TEST_UMA_WINDOW_CACHE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The cache is process-global; keep synthetic addresses away from other GPU tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::real::window_va_tests::cached_addresses_cover_each_supported_heap_window", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("1 passed; 0 failed"), "the isolated cache regression ran: {stdout}");
+            return;
+        }
+        for (round, count) in [4usize, 8, crate::gpu::uma::MAX_HEAP_WINDOWS, 4].into_iter().enumerate() {
+            let addresses: Vec<u64> = (0..count).map(|k| 0x1_0000_0000 + ((round as u64) << 28) + ((k as u64) << 16)).collect();
+            set_uma_windows(addresses.iter().map(|&va| (0, va)).collect());
+            assert_eq!(uma_window_vas(), addresses);
+            for (k, &expected) in addresses.iter().enumerate() {
+                assert_eq!(uma_window_va(k), Some(expected), "round {round}, window {k}");
+            }
+            assert_eq!(uma_window_va(count), None, "round {round}: no window past the published count");
+        }
+    }
 }
 
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
