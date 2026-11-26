@@ -70,11 +70,12 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
-/// `XCL_DIRECT_DXIL=1`: the direct DXIL translator's kernel for a kernel-mode program with
-/// one memory window (else `hlsl`, the HLSL path's container).
+/// `XCL_DIRECT_DXIL=1`: the direct DXIL translator for a supported memory-window layout
+/// (else `hlsl`, the HLSL path's container).
 fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
-    let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
+    let max_windows = if opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS } else { crate::gpu::uma::MAX_WINDOWS } as u32;
+    let windows = opt.mem_windows <= max_windows && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
     if !runner::direct_dxil() || !windows {
         return hlsl;
     }
@@ -90,6 +91,37 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
         Mode::Pixel(ps) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         _ => hlsl,
     }
+}
+
+#[test]
+fn direct_test_helper_honors_expanded_heap_windows() {
+    const CHILD: &str = "XCL_TEST_DIRECT_EXPANDED_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gpu::recomp::tests::direct_test_helper_honors_expanded_heap_windows", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("XCL_DIRECT_DXIL", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("1 passed; 0 failed"), "the isolated direct regression ran: {stdout}");
+        return;
+    }
+    let code = prog(&[]);
+    let fallback = b"HLSL fallback sentinel".to_vec();
+    let compute = Mode::Compute(super::CsInterface { threads: [1, 1, 1], ..Default::default() });
+    let mesh = Mode::Mesh(super::MsInterface { threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() });
+    for mode in [compute.clone(), mesh] {
+        for windows in [8, crate::gpu::uma::MAX_HEAP_WINDOWS as u32] {
+            let opt = Options { mode: mode.clone(), wave64: false, mem_windows: windows, heap_windows: true, ..Default::default() };
+            let dxil = direct_or(&code, &opt, fallback.clone());
+            assert_ne!(dxil, fallback, "requested direct {windows}-window {mode:?}");
+            assert!(crate::gpu::shader::container_parts(&dxil).is_some_and(|parts| parts.iter().any(|p| p.fourcc == "DXIL")));
+        }
+    }
+    let unsupported = Options { mode: compute, wave64: false, mem_windows: crate::gpu::uma::MAX_HEAP_WINDOWS as u32, heap_windows: false, ..Default::default() };
+    assert_eq!(direct_or(&code, &unsupported, fallback.clone()), fallback, "expanded windows still require heap views");
 }
 
 /// `XCL_DIRECT_DXIL=1`: a kernel-mode program the HLSL path only compiles must also go
@@ -3999,8 +4031,21 @@ fn gpu_unified_memory_arena() {
 /// 1; with one window – what MS / GS programs got before – it read the decoys.
 #[test]
 fn gpu_mesh_mode_reads_memory_windows() {
+    mesh_mode_reads_memory_windows(2, false);
+}
+
+/// The existing NGG record readback from window 15, through heap-indexed memory.
+#[test]
+fn gpu_mesh_mode_reads_expanded_heap_windows() {
+    mesh_mode_reads_memory_windows(crate::gpu::uma::MAX_HEAP_WINDOWS, true);
+}
+
+fn mesh_mode_reads_memory_windows(window_count: usize, heap: bool) {
     if !gpu_ready() {
         return;
+    }
+    if heap && runner::direct_dxil() && !runner::split_wave64() {
+        return runner::skip_test("expanded direct mesh check needs split wave64");
     }
     use super::{dxc, MsInterface, MESH_HEADER};
     let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
@@ -4025,8 +4070,8 @@ fn gpu_mesh_mode_reads_memory_windows() {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let code = prog(&refs);
-    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
-    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let arena = crate::gpu::uma::Uma::with_windows(window_count, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(window_count - 1).0 as u64);
     let word = |a: u64| unsafe { &mut *(a as *mut u32) };
     for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
         for (k, v) in [*x, *y, 0.0, 1.0].iter().enumerate() {
@@ -4035,18 +4080,24 @@ fn gpu_mesh_mode_reads_memory_windows() {
         }
     }
     let mut st = KernelState::default();
-    // V#: the vertex table in window 1, stride 16, 3 records
+    // V#: the vertex table in the last window, stride 16, 3 records
     st.sgpr[16..20].copy_from_slice(&[(w1 + 0x100) as u32, ((w1 >> 32) as u32) & 0xFFFF | 16 << 16, 3, 0]);
     let vd = ms.vert_dwords();
     let positions = |windows: u32| -> Vec<[f32; 4]> {
-        let t = super::translate_mesh(&code, ms.clone(), true, runner::split_wave64(), windows).unwrap();
+        let opt = Options { mode: Mode::Mesh(ms.clone()), wave64: true, split_wave64: runner::split_wave64(), mem_windows: windows, heap_windows: heap, ..Default::default() };
+        let t = translate(&code, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let cs = if heap && runner::direct_dxil() {
+            let direct = direct_or(&code, &opt, Vec::new());
+            assert!(crate::gpu::shader::container_parts(&direct).is_some_and(|parts| parts.iter().any(|p| p.fourcc == "DXIL")), "requested direct mesh translation did not return DXIL");
+            direct
+        } else { hlsl };
         let r = runner::run_in_arena(&cs, &st, &arena).unwrap();
         assert_eq!((r.raw[0], r.raw[1]), (3, 1), "GS_ALLOC_REQ counts ({windows} windows)");
         (0..3).map(|v| std::array::from_fn(|c| f32::from_bits(r.raw[MESH_HEADER + v * vd + c]))).collect()
     };
-    assert_eq!(positions(2), vec![[-1.0, -1.0, 0.0, 1.0], [-1.0, 1.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0]], "the vertex table from window 1");
+    assert_eq!(positions(window_count as u32), vec![[-1.0, -1.0, 0.0, 1.0], [-1.0, 1.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0]], "the vertex table from window {}", window_count - 1);
     assert_eq!(positions(1)[0], [9.0; 4], "one window: window 0 at the same offset (the old MS / GS translation)");
 }
 
@@ -4781,12 +4832,27 @@ fn geometry_es_gs_strip(branches: bool) {
 /// native form where the GPU has 64-lane waves (the compute pass alone: no mesh shaders needed).
 #[test]
 fn gpu_geometry_wave32_prefix_count_over_a_mask() {
+    geometry_wave32_prefix_count_over_a_mask(false);
+}
+
+#[test]
+fn gpu_geometry_direct_expanded_heap_prefix_counts() {
+    geometry_wave32_prefix_count_over_a_mask(true);
+}
+
+fn geometry_wave32_prefix_count_over_a_mask(expanded: bool) {
     if !gpu_ready() {
         return;
+    }
+    if expanded && !runner::split_wave64() {
+        return runner::skip_test("expanded direct geometry check needs split wave64");
     }
     use super::{dxc, translate_geometry, GsInterface, IO_GS_PRIMS};
     let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap();
     let mut es = Vec::new();
+    if expanded {
+        es.extend(e("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125)], None));
+    }
     es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
     es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None)); // lane
     es.extend(e("V_AND_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 131), ("VSRC1", 20)], None));
@@ -4805,6 +4871,9 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     // s[8:9] + lane · 4: v22 at +0, v23 at +256, v24 at +512
     es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 25), ("SRC0", 130), ("VSRC1", 20)], None));
     for (k, d) in [22u64, 23, 24].into_iter().enumerate() {
+        if expanded {
+            es.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", d), ("SRC0", 20), ("VSRC1", d)], None));
+        }
         es.extend(e("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 25), ("DATA", d), ("SADDR", 8), ("OFFSET", 256 * k as u64)], None));
     }
     es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None));
@@ -4835,6 +4904,26 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     let below = |m: u64, l: usize| (m & ((1u64 << l) - 1)).count_ones();
     let (vcc, s10) = ((0..64).filter(|l| l & 3 != 0).fold(0u64, |m, l| m | 1 << l), (1u64 << 40) - 1);
     let want: Vec<[u32; 3]> = (0..64).map(|l| [below(vcc, l), below(s10, l), if vcc >> l & 1 == 1 { below(vcc, l) } else { 0xFFFF }]).collect();
+    if expanded {
+        let arena = crate::gpu::uma::Uma::with_windows(16, 1 << 20).expect("sixteen windows");
+        let low = arena.window(0).0 + 0x400;
+        let high = arena.window(15).0 + 0x400;
+        unsafe { *(low as *mut u32) = 0xBAD0_BAD0; *(high as *mut u32) = 0; }
+        let mut state = KernelState::default();
+        state.sgpr[8] = high as u32;
+        state.sgpr[9] = (high >> 32) as u32;
+        state.sgpr[IO_GS_PRIMS] = 21;
+        let opts = crate::gpu::dxil::kernel::KernelOptions {
+            wave64: true, split: true, mem_windows: 16 | super::HEAP_WINDOWS, sampler_base: 0,
+        };
+        let dxil = crate::gpu::dxil::kernel::translate_geometry(&code, opts, &g).expect("direct legacy GS with sixteen windows").dxil;
+        runner::run_in_arena(&dxil, &state, &arena).expect("legacy GS compute pass");
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| unsafe { *((high + 256 * k + 4 * l) as *const u32) })).collect();
+        assert_eq!(got, want, "direct legacy GS loads/stores in window15, all64 lanes");
+        assert_eq!(unsafe { *(low as *const u32) }, 0xBAD0_BAD0, "window0 decoy stays untouched");
+        println!("DIRECT_LEGACY_GS_WINDOWS=16 LANES=64 FIELDS=3");
+        return;
+    }
     let mut io = vec![0u32; 128];
     io[8] = 0x400;
     io[IO_GS_PRIMS] = 21;
